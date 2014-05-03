@@ -1,0 +1,160 @@
+#!/usr/bin/perl -w
+# -*- perl -*-
+use strict;
+use warnings;
+
+###########################################################
+# docker2vagrant                                          #
+#                                                         #
+# Little script to transform Dockerfile into Vagrantfile. #
+# @author Augustin Peyrard                                #
+# @date   2014/05/03                                      #
+###########################################################
+
+my $VERSION = 0.1;
+
+# default values for arguments, if not specified in command line, those values will be used
+my $FILENAME = 'Dockerfile';
+my $BOX = 'precise64';
+my $BOXURL = 'http://files.vagrantup.com/precise64.box';
+my $OUTPUT = '.';
+
+# print help
+sub help {
+    print "usage: docker2vagrant [-f|--file dockerFileName] [-b|--box vagrantbox] [-u|--box-url url4box] [-o|--output outputPath]\n"
+}
+
+# analyze command line
+sub cl {
+    while ($_ = shift @_) {
+        if (/^-f$/ || /^--file/) {
+            $FILENAME = shift @_;
+        } elsif (/^-b$/ || /^--box/) {
+            $BOX = shift @_;
+        } elsif (/^-u$/ || /^--url/) {
+            $BOXURL = shift @_;
+        } elsif (/^-o$/ || /^--output/) {
+            $OUTPUT = shift @_;
+        }elsif (/^-v$/ || /^--version/) {
+            print "$VERSION\n";
+            exit 0;
+        } else {
+            &help;
+            exit 0;
+        }
+    }
+}
+
+# Analyze the Dockerfile and tranform it into a Vagrantfile and a bootstrap.sh script for provisioning.
+sub transform {
+    # open the Dockerfile
+    open (my $IN, "<", $FILENAME) or die "Unable to open the Dockerfile (in read mode): $FILENAME -> $!\n";
+    # create the Vagrantfile and the bootstrap.sh
+    open (my $OUT_VF, ">", "$OUTPUT/Vagrantfile") or die "Unable to open the Vagrantfile (in write mode): $OUTPUT/Vagrantfile -> $!\n";
+    open (my $OUT_BS, ">", "$OUTPUT/bootstrap.sh") or die "Unable to open the bootstrap.sh (in write mode): $OUTPUT/bootstrap.sh -> $!\n";
+
+    my @ports = ();
+    my $service;
+    foreach (<$IN>) {
+        my $line = $_;
+        if (/^from(.*)$/i) {
+            next; # skip line
+        } elsif (/^run\s+(.*)$/i) {
+            $line = "$1\n";
+        } elsif (/^add\s+\.(.*)$/i) {
+            $line = "cp -R -p /vagrant$1\n";
+        } elsif (/^add\s+(.*)$/i) {
+            $line = "cp -R -p /vagrant/$1\n";
+        } elsif (/^expose\s+\d+:(\d+).*$/i) { # old method some files were exposing the port by defining the host ports
+            $line = "# $line";
+            push @ports, $1;
+        } elsif (/^expose\s+(\d+).*$/i) {
+            $line = "# $line";
+            push @ports, $1;
+        } elsif (/^cmd\s+\["(.*)"\]$/i) {
+            $line = "# $line";
+            $service = $1;
+        }
+
+        # print the transformed line in the bootstrap script
+        print $OUT_BS $line;
+    }
+    if (defined $service && $service ne '') {
+        &createServiceFile($service);
+        print $OUT_BS "\n# install startup service (created by $0)\n";
+        print $OUT_BS "cp /vagrant/service.sh /etc/init.d/startup_service\n";
+        print $OUT_BS "chmod +x /etc/init.d/startup_service\n";
+        print $OUT_BS "update-rc.d startup_service default\n"; # command for debian/ubuntu only :/
+        print $OUT_BS "/etc/init.d/startup_service start\n";
+    }
+
+    # create the vagrant file
+    print $OUT_VF "Vagrant.configure(\"2\") do |config|\n";
+    print $OUT_VF "  config.vm.box = \"$BOX\"\n";
+    print $OUT_VF "  config.vm.box_url = \"$BOXURL\"\n\n";
+    foreach my $port (@ports) {
+        # ignore ssh port, forwarded by vagrant itself
+        if ($port == 22) {
+            next;
+        }
+        # avoid using system port
+        my $hostPort = $port;
+        if ($port <= 1024) {
+            $hostPort = $port + 9000;
+        }
+        print $OUT_VF "  config.vm.network :forwarded_port, host: $hostPort, guest: $port\n";
+    }
+    print $OUT_VF "\n  config.vm.provision :shell, :path => \"bootstrap.sh\"\n";
+    print $OUT_VF "end";
+
+    # close the files
+    close $IN;
+    close $OUT_VF;
+    close $OUT_BS;
+}
+
+# create the service file
+sub createServiceFile {
+    my $service = shift;
+
+    open (my $OUT_SERV, ">", "$OUTPUT/service.sh") or die "Unable to open the service file (in write mode): $OUTPUT/service -> $!\n";
+    my $serviceScriptContent = <<"EOF";
+#!/bin/sh
+#
+# Startup script for $service
+PID_FILE=/tmp/service.pid
+case \"\$1\" in
+start)
+nohup $service &
+pidof \$0 > \$PID_FILE
+;;
+
+stop)
+kill -9 `cat \$PID_FILE`
+;;
+
+restart)
+\$0 stop
+\$0 start
+;;
+
+reload)
+\$0 restart
+;;
+
+*)
+exit 1
+;;
+
+esac
+EOF
+
+    print $OUT_SERV $serviceScriptContent;
+
+    close $OUT_SERV;
+}
+
+# launch the command line analyze
+&cl(@ARGV);
+# launch the transformation
+&transform
